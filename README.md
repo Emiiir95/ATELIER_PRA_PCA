@@ -193,14 +193,21 @@ Ce playbook fait, dans l'ordre :
 4. Attend que chaque Deployment soit `Ready` (status check toutes les 5s)
 5. Affiche la liste finale des services
 
-### Étape 6 — Seeder la base
+### Étape 6 — Seeder la base ⚠️ OBLIGATOIRE
 
 ```bash
 kubectl -n trombi exec -it deploy/backend -- node prisma/seed.js
 ```
 
+⚠️ **À refaire à chaque fois que la BDD est vide** :
+- Au premier déploiement (BDD vide)
+- Après suppression du PVC `trombi-data` sans restore
+- Si tu fais `kubectl delete namespace trombi` et redéploies
+
+(Pas besoin de re-seed après le scénario PRA si tu as bien restauré — le restore remet les données.)
+
 Crée :
-- 3 utilisateurs : `admin@trombi.fr / Admin123!` (admin) + 2 teachers
+- 3 utilisateurs : `admin@trombi.fr / Admin123!` (admin) + 2 teachers (`dupont@trombi.fr` et `martin@trombi.fr` / `Teacher123!`)
 - 3 classes : BTS SIO SLAM, BTS SIO SISR, Bachelor DevOps
 - 15 élèves dont 12 avec photos seed
 
