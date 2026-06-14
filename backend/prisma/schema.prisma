@@ -1,0 +1,57 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  TEACHER
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(TEACHER)
+  createdAt    DateTime @default(now())
+  exports      Export[]
+}
+
+model Class {
+  id        Int       @id @default(autoincrement())
+  label     String
+  year      String
+  createdAt DateTime  @default(now())
+  students  Student[]
+  exports   Export[]
+}
+
+model Student {
+  id        Int      @id @default(autoincrement())
+  firstName String
+  lastName  String
+  email     String   @unique
+  photoUrl  String?
+  createdAt DateTime @default(now())
+  class     Class?   @relation(fields: [classId], references: [id])
+  classId   Int?
+
+  @@index([classId])
+  @@index([lastName])
+}
+
+model Export {
+  id        Int      @id @default(autoincrement())
+  format    String   // html | pdf
+  path      String
+  createdAt DateTime @default(now())
+  class     Class    @relation(fields: [classId], references: [id])
+  classId   Int
+  createdBy User?    @relation(fields: [userId], references: [id])
+  userId    Int?
+}

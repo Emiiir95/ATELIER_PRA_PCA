@@ -1,283 +1,252 @@
-------------------------------------------------------------------------------------------------------
-ATELIER PRA/PCA
-------------------------------------------------------------------------------------------------------
-L’idée en 30 secondes : Cet atelier met en œuvre un **mini-PRA** sur **Kubernetes** en déployant une **application Flask** avec une **base SQLite** stockée sur un **volume persistant (PVC pra-data)** et des **sauvegardes automatiques réalisées chaque minute vers un second volume (PVC pra-backup)** via un **CronJob**. L’**image applicative est construite avec Packer** et le **déploiement orchestré avec Ansible**, tandis que Kubernetes assure la gestion des pods et de la disponibilité applicative. Nous observerons la différence entre **disponibilité** (recréation automatique des pods sans perte de données) et **reprise après sinistre** (perte volontaire du volume de données puis restauration depuis les backups), nous mesurerons concrètement les RTO et RPO, et comprendrons les limites d’un PRA local non répliqué. Cet atelier illustre de manière pratique les principes de continuité et de reprise d’activité, ainsi que le rôle respectif des conteneurs, du stockage persistant et des mécanismes de sauvegarde.
-  
-**Architecture cible :** Ci-dessous, voici l'architecture cible souhaitée.   
-  
-![Screenshot Actions](Architecture_cible.png)  
-  
--------------------------------------------------------------------------------------------------------
-Séquence 1 : Codespace de Github
--------------------------------------------------------------------------------------------------------
-Objectif : Création d'un Codespace Github  
-Difficulté : Très facile (~5 minutes)
--------------------------------------------------------------------------------------------------------
-**Faites un Fork de ce projet**. Si besoin, voici une vidéo d'accompagnement pour vous aider à "Forker" un Repository Github : [Forker ce projet](https://youtu.be/p33-7XQ29zQ) 
-  
-Ensuite depuis l'onglet **[CODE]** de votre nouveau Repository, **ouvrez un Codespace Github**.
-  
----------------------------------------------------
-Séquence 2 : Création du votre environnement de travail
----------------------------------------------------
-Objectif : Créer votre environnement de travail  
-Difficulté : Simple (~10 minutes)
----------------------------------------------------
-Vous allez dans cette séquence mettre en place un cluster Kubernetes K3d contenant un master et 2 workers, installer les logiciels Packer et Ansible. Depuis le terminal de votre Codespace copier/coller les codes ci-dessous étape par étape :  
+# ATELIER PRA/PCA — Trombinoscope
 
-**Création du cluster K3d**  
+Mini-PRA/PCA appliqué au projet **Trombinoscope** (Node.js + Postgres + React) déployé sur **Kubernetes K3d** dans un **GitHub Codespace**.
+
+L'application Trombinoscope (gestion d'élèves, classes, photos, génération PDF) est déployée dans un cluster Kubernetes local. La base PostgreSQL est stockée sur un volume persistant `trombi-data`. Toutes les minutes, un CronJob réalise un `pg_dump` vers un second volume `trombi-backup`. L'**image applicative est construite avec Packer**, le **déploiement orchestré avec Ansible**.
+
+Cet atelier illustre la différence entre :
+- **PCA** (continuité) : Kubernetes recrée automatiquement un pod détruit, aucune perte de données
+- **PRA** (reprise) : restauration de la base depuis le dernier backup après perte du volume
+
+---
+
+## Architecture
+
 ```
-curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+                     ┌─────────────────┐
+                     │  Cluster K3d    │
+                     │   namespace:    │
+                     │     trombi      │
+                     └─────────────────┘
+       ┌───────────┐   ┌───────────┐   ┌────────────┐
+       │ frontend  │──▶│  backend  │──▶│ postgres   │
+       │ (nginx)   │   │ (Node.js) │   │  (Pg 16)   │
+       │  :80      │   │  :3000    │   │   :5432    │
+       └───────────┘   └───────────┘   └─────┬──────┘
+                                              │
+                                       ┌──────▼──────┐
+                                       │ trombi-data │  (PVC 1Gi)
+                                       └─────────────┘
+
+                       ┌────────────────────────┐
+                       │ CronJob (1min)         │
+                       │   pg_dump → /backup    │──▶ trombi-backup (PVC 1Gi)
+                       └────────────────────────┘
 ```
-```
-k3d cluster create pra \
-  --servers 1 \
-  --agents 2
-```
-**vérification de la création de votre cluster Kubernetes**  
-```
+
+---
+
+## Séquence 1 — Codespace
+
+1. **Fork** ce repo
+2. Sur ton fork : **Code → Codespaces → Create codespace on main**
+3. Attends que le `postCreateCommand` finisse (~3 min : k3d, packer, ansible sont installés automatiquement)
+
+---
+
+## Séquence 2 — Créer le cluster
+
+```bash
+# Crée le cluster K3d (1 master + 2 workers)
+k3d cluster create trombi --servers 1 --agents 2
+
+# Vérifie
 kubectl get nodes
 ```
-**Installation du logiciel Packer (création d'images Docker)**  
-```
-PACKER_VERSION=1.11.2
-curl -fsSL -o /tmp/packer.zip \
-  "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip"
-sudo unzip -o /tmp/packer.zip -d /usr/local/bin
-rm -f /tmp/packer.zip
-```
-**Installation du logiciel Ansible**  
-```
-python3 -m pip install --user ansible kubernetes PyYAML jinja2
-export PATH="$HOME/.local/bin:$PATH"
-ansible-galaxy collection install kubernetes.core
-```
-  
----------------------------------------------------
-Séquence 3 : Déploiement de l'infrastructure
----------------------------------------------------
-Objectif : Déployer l'infrastructure sur le cluster Kubernetes
-Difficulté : Facile (~15 minutes)
----------------------------------------------------  
-Nous allons à présent déployer notre infrastructure sur Kubernetes. C'est à dire, créér l'image Docker de notre application Flask avec Packer, déposer l'image dans le cluster Kubernetes et enfin déployer l'infratructure avec Ansible (Création du pod, création des PVC et les scripts des sauvegardes aututomatiques).  
 
-**Création de l'image Docker avec Packer**  
-```
+---
+
+## Séquence 3 — Builder les images avec Packer
+
+```bash
 packer init .
 packer build -var "image_tag=1.0" .
-docker images | head
+
+# Vérifie
+docker images | grep trombi
+# trombi/backend   1.0   ...
+# trombi/frontend  1.0   ...
 ```
-  
-**Import de l'image Docker dans le cluster Kubernetes**  
-```
-k3d image import pra/flask-sqlite:1.0 -c pra
-```
-  
-**Déploiment de l'infrastructure dans Kubernetes**  
-```
+
+Packer construit **2 images** :
+- `trombi/backend:1.0` — Node 20 + Prisma + dépendances backend
+- `trombi/frontend:1.0` — Vite build → Nginx alpine servant les statics
+
+---
+
+## Séquence 4 — Déployer avec Ansible
+
+```bash
+# Import les images dans le cluster k3d
+k3d image import trombi/backend:1.0 -c trombi
+k3d image import trombi/frontend:1.0 -c trombi
+
+# Déploie tout (postgres + backend + frontend + CronJob backup)
 ansible-playbook ansible/playbook.yml
 ```
-  
-**Forward du port 8080 qui est le port d'exposition de votre application Flask**  
-```
-kubectl -n pra port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 &
-```
-  
----------------------------------------------------  
-**Réccupération de l'URL de votre application Flask**. Votre application Flask est déployée sur le cluster K3d. Pour obtenir votre URL cliquez sur l'onglet **[PORTS]** dans votre Codespace (à coté de Terminal) et rendez public votre port 8080 (Visibilité du port). Ouvrez l'URL dans votre navigateur et c'est terminé.  
 
-**Les routes** à votre disposition sont les suivantes :  
-1. https://...**/** affichera dans votre navigateur "Bonjour tout le monde !".
-2. https://...**/health** pour voir l'état de santé de votre application.
-3. https://...**/add?message=test** pour ajouter un message dans votre base de données SQLite.
-4. https://...**/count** pour afficher le nombre de messages stockés dans votre base de données SQLite.
-5. https://...**/consultation** pour afficher les messages stockés dans votre base de données.
-  
----------------------------------------------------  
-### Processus de sauvegarde de la BDD SQLite
+Le playbook :
+1. Vérifie que le cluster K3d existe (le crée sinon)
+2. Importe les images Docker
+3. Applique tous les manifestes `k8s/`
+4. Attend que chaque déploiement soit `Ready`
+5. Affiche les services
 
-Grâce à une tâche CRON déployée par Ansible sur le cluster Kubernetes (un CronJob), toutes les minutes une sauvegarde de la BDD SQLite est faite depuis le PVC pra-data vers le PCV pra-backup dans Kubernetes.  
+---
 
-Pour visualiser les sauvegardes périodiques déposées dans le PVC pra-backup, coller les commandes suivantes dans votre terminal Codespace :  
+## Séquence 5 — Accéder à l'application
 
+```bash
+# Forward le port 80 du frontend vers ton Codespace
+kubectl -n trombi port-forward svc/frontend 8080:80 >/tmp/web.log 2>&1 &
 ```
-kubectl -n pra run debug-backup \
-  --rm -it \
-  --image=alpine \
-  --overrides='
-{
-  "spec": {
-    "containers": [{
-      "name": "debug",
-      "image": "alpine",
-      "command": ["sh"],
-      "stdin": true,
-      "tty": true,
-      "volumeMounts": [{
-        "name": "backup",
-        "mountPath": "/backup"
-      }]
-    }],
-    "volumes": [{
-      "name": "backup",
-      "persistentVolumeClaim": {
-        "claimName": "pra-backup"
-      }
-    }]
-  }
-}'
+
+Dans Codespace, onglet **PORTS** → rends **public** le port 8080. Ouvre l'URL.
+
+**Connexion** :
+- Email : `admin@trombi.fr`
+- Mot de passe : `Admin123!`
+
+(Le seed se fait au premier démarrage backend, voir notes ci-dessous)
+
+### Seed initial de la base
+
+Une fois le backend Ready, exécute le seed pour créer les comptes admin/teacher et les classes/élèves :
+
+```bash
+kubectl -n trombi exec -it deploy/backend -- node prisma/seed.js
 ```
-```
+
+---
+
+## Séquence 6 — Visualiser les backups
+
+Le CronJob `postgres-backup` tourne **toutes les minutes** :
+
+```bash
+# Liste les backups dans le PVC trombi-backup
+kubectl -n trombi run debug-backup \
+  --rm -it --image=alpine \
+  --overrides='{"spec":{"containers":[{"name":"debug","image":"alpine","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"backup","mountPath":"/backup"}]}],"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":"trombi-backup"}}]}}'
+
+# Une fois dans le pod :
 ls -lh /backup
-```
-**Pour sortir du cluster et revenir dans le terminal**
-```
 exit
 ```
 
----------------------------------------------------
-Séquence 4 : 💥 Scénarios de crash possibles  
-Difficulté : Facile (~30 minutes)
----------------------------------------------------
-### 🎬 **Scénario 1 : PCA — Crash du pod**  
-Nous allons dans ce scénario **détruire notre Pod Kubernetes**. Ceci simulera par exemple la supression d'un pod accidentellement, ou un pod qui crash, ou un pod redémarré, etc..
+Tu verras les fichiers `trombi-YYYYMMDD-HHMMSS.dump`.
 
-**Destruction du pod :** Ci-dessous, la cible de notre scénario   
-  
-![Screenshot Actions](scenario1.png)  
+---
 
-Nous perdons donc ici notre application mais pas notre base de données puisque celle-ci est déposée dans le PVC pra-data hors du pod.  
+## 💥 Scénario 1 : PCA — Crash du pod backend
 
-Copier/coller le code suivant dans votre terminal Codespace pour détruire votre pod :
-```
-kubectl -n pra get pods
-```
-Notez le nom de votre pod qui est différent pour tout le monde.  
-Supprimez votre pod (pensez à remplacer <nom-du-pod-flask> par le nom de votre pod).  
-Exemple : kubectl -n pra delete pod flask-7c4fd76955-abcde  
-```
-kubectl -n pra delete pod <nom-du-pod-flask>
-```
-**Vérification de la suppression de votre pod**
-```
-kubectl -n pra get pods
-```
-👉 **Le pod a été reconstruit sous un autre identifiant**.  
-Forward du port 8080 du nouveau service  
-```
-kubectl -n pra port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 &
-```
-Observez le résultat en ligne  
-https://...**/consultation** -> Vous n'avez perdu aucun message.
-  
-👉 Kubernetes gère tout seul : Aucun impact sur les données ou sur votre service (PVC conserve la DB et le pod est reconstruit automatiquement) -> **C'est du PCA**. Tout est automatique et il n'y a aucune rupture de service.
-  
----------------------------------------------------
-### 🎬 **Scénario 2 : PRA - Perte du PVC pra-data** 
-Nous allons dans ce scénario **détruire notre PVC pra-data**. C'est à dire nous allons suprimer la base de données en production. Ceci simulera par exemple la corruption de la BDD SQLite, le disque du node perdu, une erreur humaine, etc. 💥 Impact : IL s'agit ici d'un impact important puisque **la BDD est perdue**.  
+Objectif : démontrer que **Kubernetes recrée automatiquement** un pod détruit, **sans perte de données**.
 
-**Destruction du PVC pra-data :** Ci-dessous, la cible de notre scénario   
-  
-![Screenshot Actions](scenario2.png)  
+```bash
+# Avant : on note l'ID du pod
+kubectl -n trombi get pods -l app=backend
 
-🔥 **PHASE 1 — Simuler le sinistre (perte de la BDD de production)**  
-Copier/coller le code suivant dans votre terminal Codespace pour détruire votre base de données :
-```
-kubectl -n pra scale deployment flask --replicas=0
-```
-```
-kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":true}}'
-```
-```
-kubectl -n pra delete job --all
-```
-```
-kubectl -n pra delete pvc pra-data
-```
-👉 Vous pouvez vérifier votre application en ligne, la base de données est détruite et la service n'est plus accéssible.  
+# On supprime le pod
+kubectl -n trombi delete pod -l app=backend
 
-✅ **PHASE 2 — Procédure de restauration**  
-Recréer l’infrastructure avec un PVC pra-data vide.  
+# Kubernetes en recrée un automatiquement
+kubectl -n trombi get pods -l app=backend -w
+# (Ctrl+C pour sortir)
 ```
-kubectl apply -f k8s/
-```
-Vérification de votre application en ligne.  
-Forward du port 8080 du service pour tester l'application en ligne.  
-```
-kubectl -n pra port-forward svc/flask 8080:80 >/tmp/web.log 2>&1 &
-```
-https://...**/count** -> =0.  
-https://...**/consultation** Vous avez perdu tous vos messages.  
 
-Retaurez votre BDD depuis le PVC Backup.  
+**Observation** : un nouveau pod apparaît en quelques secondes. Connecte-toi à l'app → toutes les données sont là (la BDD est dans le PVC, hors du pod).
+
+**Mesure** :
+- **RTO** (Recovery Time Objective) : ~10-30 s (temps de redémarrage du pod)
+- **RPO** (Recovery Point Objective) : 0 (aucune perte de données)
+
+---
+
+## 💥 Scénario 2 : PRA — Perte du volume de données
+
+Objectif : simuler une perte de la base (suppression du PVC), puis **restaurer depuis le dernier backup**.
+
+### Étape A : ajouter de la donnée
+
+Crée quelques élèves via l'UI (ou un appel API). Vérifie qu'au moins 1 minute s'est écoulée depuis ton dernier ajout pour avoir un backup à jour.
+
+### Étape B : détruire le volume de données
+
+```bash
+# Supprime le déploiement postgres (libère le PVC)
+kubectl -n trombi delete deployment postgres
+
+# Supprime le PVC contenant les données
+kubectl -n trombi delete pvc trombi-data
 ```
+
+⚠️ À ce stade, la BDD est **vide**.
+
+### Étape C : recréer le PVC + redéployer
+
+```bash
+kubectl apply -f k8s/10-pvc-data.yaml
+kubectl apply -f k8s/20-deployment-postgres.yaml
+
+# Attends que Postgres soit prêt
+kubectl -n trombi rollout status deployment/postgres
+```
+
+### Étape D : restaurer depuis le backup
+
+```bash
+# Joue le Job de restauration (pg_restore depuis le dernier .dump)
+ansible-playbook ansible/playbook.yml -e do_restore=true
+```
+
+Ou manuellement :
+
+```bash
 kubectl apply -f pra/50-job-restore.yaml
+kubectl -n trombi wait --for=condition=complete job/postgres-restore --timeout=180s
+kubectl -n trombi logs job/postgres-restore
 ```
-👉 Vous pouvez vérifier votre application en ligne, **votre base de données a été restaureé** et tous vos messages sont bien présents.  
 
-Relance des CRON de sauvgardes.  
+### Étape E : vérifier
+
+Reconnecte-toi à l'application → toutes les données du dernier backup sont restaurées.
+
+**Mesure** :
+- **RTO** : ~1-2 min (redéploiement + restore)
+- **RPO** : ≤ 1 min (intervalle entre 2 backups CronJob)
+
+---
+
+## Structure du repo
+
 ```
-kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":false}}'
+.
+├── .devcontainer/        # Configuration Codespace (devcontainer.json + post-create.sh)
+├── ansible/
+│   └── playbook.yml      # Orchestration du déploiement K8s
+├── backend/              # Code source Trombinoscope backend (Node.js + Prisma)
+├── frontend/             # Code source Trombinoscope frontend (React + Vite)
+├── k8s/                  # Manifestes Kubernetes
+│   ├── 00-namespace.yaml
+│   ├── 05-secret.yaml
+│   ├── 10-pvc-data.yaml
+│   ├── 11-pvc-backup.yaml
+│   ├── 20-deployment-postgres.yaml
+│   ├── 21-deployment-backend.yaml
+│   ├── 22-deployment-frontend.yaml
+│   ├── 30-services.yaml
+│   └── 40-cronjob-backup.yaml
+├── pra/
+│   └── 50-job-restore.yaml   # Job de restore postgres
+├── packer.pkr.hcl        # Build des 2 images Docker (backend + frontend)
+└── README.md
 ```
-👉 Nous n'avons pas perdu de données mais Kubernetes ne gère pas la restauration tout seul. Nous avons du protéger nos données via des sauvegardes régulières (du PVC pra-data vers le PVC pra-backup). -> **C'est du PRA**. Il s'agit d'une stratégie de sauvegarde avec une procédure de restauration.  
 
----------------------------------------------------
-Séquence 5 : Exercices  
-Difficulté : Moyenne (~45 minutes)
----------------------------------------------------
-**Complétez et documentez ce fichier README.md** pour répondre aux questions des exercices.  
-Faites preuve de pédagogie et soyez clair dans vos explications et procedures de travail.  
+---
 
-**Exercice 1 :**  
-Quels sont les composants dont la perte entraîne une perte de données ?  
-  
-*..Répondez à cet exercice ici..*
+## Notes & limites
 
-**Exercice 2 :**  
-Expliquez nous pourquoi nous n'avons pas perdu les données lors de la supression du PVC pra-data  
-  
-*..Répondez à cet exercice ici..*
-
-**Exercice 3 :**  
-Quels sont les RTO et RPO de cette solution ?  
-  
-*..Répondez à cet exercice ici..*
-
-**Exercice 4 :**  
-Pourquoi cette solution (cet atelier) ne peux pas être utilisé dans un vrai environnement de production ? Que manque-t-il ?   
-  
-*..Répondez à cet exercice ici..*
-  
-**Exercice 5 :**  
-Proposez une archtecture plus robuste.   
-  
-*..Répondez à cet exercice ici..*
-
----------------------------------------------------
-Séquence 6 : Ateliers  
-Difficulté : Moyenne (~2 heures)
----------------------------------------------------
-### **Atelier 1 : Ajoutez une fonctionnalité à votre application**  
-**Ajouter une route GET /status** dans votre application qui affiche en JSON :
-* count : nombre d’événements en base
-* last_backup_file : nom du dernier backup présent dans /backup
-* backup_age_seconds : âge du dernier backup
-
-*..**Déposez ici une copie d'écran** de votre réussite..*
-
----------------------------------------------------
-### **Atelier 2 : Choisir notre point de restauration**  
-Aujourd’hui nous restaurobs “le dernier backup”. Nous souhaitons **ajouter la capacité de choisir un point de restauration**.
-
-*..Décrir ici votre procédure de restauration (votre runbook)..*  
-  
----------------------------------------------------
-Evaluation
----------------------------------------------------
-Cet atelier PRA PCA, **noté sur 20 points**, est évalué sur la base du barème suivant :  
-- Série d'exerices (5 points)
-- Atelier N°1 - Ajout d'un fonctionnalité (4 points)
-- Atelier N°2 - Choisir son point de restauration (4 points)
-- Qualité du Readme (lisibilité, erreur, ...) (3 points)
-- Processus travail (quantité de commits, cohérence globale, interventions externes, ...) (4 points) 
-
+- Le cluster K3d tourne dans le Codespace : **éphémère**, tout disparaît quand le Codespace s'éteint.
+- Pour un vrai PRA prod, il faudrait **réplication géographique** (backup vers un stockage hors-cluster, type S3).
+- Le `JWT_SECRET` dans `k8s/05-secret.yaml` est dev — à changer en prod.
+- L'option `STORAGE=local` du backend stocke les photos dans `/app/uploads` (éphémère). Pour persister, brancher MinIO ou S3.

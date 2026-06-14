@@ -1,32 +1,36 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: sqlite-backup
-  namespace: pra
+  name: postgres-backup
+  namespace: trombi
 spec:
   schedule: "*/1 * * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
       template:
         spec:
           restartPolicy: OnFailure
           containers:
-            - name: backup
-              image: alpine
+            - name: pg-dump
+              image: postgres:16
+              envFrom:
+                - secretRef:
+                    name: trombi-secrets
               command: ["/bin/sh","-c"]
               args:
                 - |
-                  TS=$(date +%s)
-                  cp /data/app.db /backup/app-$TS.db || true
+                  TS=$(date +%Y%m%d-%H%M%S)
+                  PGPASSWORD="$POSTGRES_PASSWORD" pg_dump \
+                    -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                    -Fc -f /backup/trombi-$TS.dump
+                  echo "Backup OK: trombi-$TS.dump"
+                  ls -lh /backup
               volumeMounts:
-                - name: data
-                  mountPath: /data
                 - name: backup
                   mountPath: /backup
           volumes:
-            - name: data
-              persistentVolumeClaim:
-                claimName: pra-data
             - name: backup
               persistentVolumeClaim:
-                claimName: pra-backup
+                claimName: trombi-backup

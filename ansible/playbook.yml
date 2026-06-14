@@ -1,12 +1,13 @@
-- name: PRA workshop - deploy + restore (k3d)
+- name: Trombinoscope PRA/PCA - deploy + restore (k3d)
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
-    cluster_name: pra
-    namespace: pra
-    image: "pra/flask-sqlite:1.0"
+    cluster_name: trombi
+    namespace: trombi
+    backend_image: "trombi/backend:1.0"
+    frontend_image: "trombi/frontend:1.0"
     do_restore: false   # mets true pour faire un restore automatiquement
 
   tasks:
@@ -30,10 +31,12 @@
       register: nodes
       changed_when: false
 
-    - name: Import local Docker image into k3d cluster
-      ansible.builtin.shell: |
-        set -e
-        k3d image import {{ image }} -c {{ cluster_name }}
+    - name: Import backend image into k3d cluster
+      ansible.builtin.command: k3d image import {{ backend_image }} -c {{ cluster_name }}
+      changed_when: true
+
+    - name: Import frontend image into k3d cluster
+      ansible.builtin.command: k3d image import {{ frontend_image }} -c {{ cluster_name }}
       changed_when: true
 
     - name: Apply K8s manifests
@@ -41,22 +44,49 @@
       args:
         chdir: ".."
 
-    - name: Wait for deployment rollout
-      ansible.builtin.command: kubectl -n {{ namespace }} rollout status deployment/flask --timeout=180s
+    - name: Wait for postgres rollout
+      ansible.builtin.command: kubectl -n {{ namespace }} rollout status deployment/postgres --timeout=180s
       changed_when: false
 
+    - name: Wait for backend rollout
+      ansible.builtin.command: kubectl -n {{ namespace }} rollout status deployment/backend --timeout=180s
+      changed_when: false
+
+    - name: Wait for frontend rollout
+      ansible.builtin.command: kubectl -n {{ namespace }} rollout status deployment/frontend --timeout=180s
+      changed_when: false
+
+    - name: Show services
+      ansible.builtin.command: kubectl -n {{ namespace }} get svc
+      register: svc_list
+      changed_when: false
+
+    - name: Print services
+      ansible.builtin.debug:
+        var: svc_list.stdout_lines
+
+    # ── PRA : Restore optionnel ──────────────────────────────────────
     - name: Optional restore (delete + apply job + wait)
       when: do_restore | bool
       block:
         - name: Delete restore job if exists
-          ansible.builtin.command: kubectl -n {{ namespace }} delete job/sqlite-restore --ignore-not-found=true
+          ansible.builtin.command: kubectl -n {{ namespace }} delete job/postgres-restore --ignore-not-found=true
           changed_when: false
 
         - name: Apply restore job
-          ansible.builtin.command: kubectl apply -f k8s/50-job-restore.yaml
+          ansible.builtin.command: kubectl apply -f pra/50-job-restore.yaml
           args:
             chdir: ".."
 
         - name: Wait restore job completion
-          ansible.builtin.command: kubectl -n {{ namespace }} wait --for=condition=complete job/sqlite-restore --timeout=180s
+          ansible.builtin.command: kubectl -n {{ namespace }} wait --for=condition=complete job/postgres-restore --timeout=180s
           changed_when: false
+
+        - name: Show restore logs
+          ansible.builtin.command: kubectl -n {{ namespace }} logs job/postgres-restore
+          register: restore_logs
+          changed_when: false
+
+        - name: Print restore logs
+          ansible.builtin.debug:
+            var: restore_logs.stdout_lines

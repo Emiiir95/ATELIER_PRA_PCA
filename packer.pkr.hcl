@@ -7,46 +7,96 @@ packer {
   }
 }
 
-variable "image_name" {
-  type    = string
-  default = "pra/flask-sqlite"
-}
-
 variable "image_tag" {
   type    = string
   default = "1.0"
 }
 
-source "docker" "flask" {
-  image  = "python:3.12-slim"
+variable "backend_image" {
+  type    = string
+  default = "trombi/backend"
+}
+
+variable "frontend_image" {
+  type    = string
+  default = "trombi/frontend"
+}
+
+# ── Backend (Node.js 20 + Prisma) ──────────────────────────────────
+source "docker" "backend" {
+  image  = "node:20-slim"
   commit = true
 }
 
 build {
-  name    = "pra-flask-sqlite"
-  sources = ["source.docker.flask"]
+  name    = "trombi-backend"
+  sources = ["source.docker.backend"]
 
-  # Copie le code dans l'image
   provisioner "file" {
-    source      = "app/"
-    destination = "/opt/app"
+    source      = "backend/"
+    destination = "/app"
   }
 
-  # Installe les dépendances
   provisioner "shell" {
     inline = [
       "set -eux",
-      "python -m pip install --no-cache-dir --upgrade pip",
-      "pip install --no-cache-dir -r /opt/app/requirements.txt",
-      "mkdir -p /data",
-      "chmod 777 /data",
-      "echo 'Packer build done.'"
+      "apt-get update -y && apt-get install -y openssl libvips ca-certificates && rm -rf /var/lib/apt/lists/*",
+      "cd /app && npm ci --omit=dev",
+      "cd /app && npx prisma generate",
+      "mkdir -p /app/uploads /app/exports",
+      "echo 'Backend build done.'"
     ]
   }
 
-  # Tag final de l'image
   post-processor "docker-tag" {
-    repository = var.image_name
+    repository = var.backend_image
+    tags       = [var.image_tag]
+  }
+}
+
+# ── Frontend (Vite build → nginx) ──────────────────────────────────
+source "docker" "frontend" {
+  image  = "nginx:alpine"
+  commit = true
+}
+
+build {
+  name    = "trombi-frontend"
+  sources = ["source.docker.frontend"]
+
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "apk add --no-cache nodejs npm",
+      "npm install -g pnpm@9",
+      "mkdir -p /build"
+    ]
+  }
+
+  provisioner "file" {
+    source      = "frontend/"
+    destination = "/build"
+  }
+
+  provisioner "file" {
+    source      = "frontend/nginx.conf"
+    destination = "/etc/nginx/conf.d/default.conf"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "set -eux",
+      "cd /build && pnpm install --frozen-lockfile && pnpm build",
+      "rm -rf /usr/share/nginx/html/*",
+      "cp -r /build/dist/. /usr/share/nginx/html/",
+      "rm -rf /build /root/.npm /root/.pnpm-store",
+      "apk del nodejs npm || true",
+      "echo 'Frontend build done.'"
+    ]
+  }
+
+  post-processor "docker-tag" {
+    repository = var.frontend_image
     tags       = [var.image_tag]
   }
 }

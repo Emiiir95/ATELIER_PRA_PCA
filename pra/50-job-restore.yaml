@@ -1,29 +1,34 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: sqlite-restore
-  namespace: pra
+  name: postgres-restore
+  namespace: trombi
 spec:
+  backoffLimit: 0
   template:
     spec:
       restartPolicy: Never
       containers:
-        - name: restore
-          image: alpine
+        - name: pg-restore
+          image: postgres:16
+          envFrom:
+            - secretRef:
+                name: trombi-secrets
           command: ["/bin/sh","-c"]
           args:
             - |
-              LATEST=$(ls -t /backup/*.db | head -1)
-              cp $LATEST /data/app.db
+              set -eux
+              LATEST=$(ls -t /backup/*.dump | head -1)
+              echo "Restoring from $LATEST"
+              PGPASSWORD="$POSTGRES_PASSWORD" pg_restore \
+                -h postgres -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                --clean --if-exists --no-owner --no-acl \
+                "$LATEST"
+              echo "Restore OK"
           volumeMounts:
-            - name: data
-              mountPath: /data
             - name: backup
               mountPath: /backup
       volumes:
-        - name: data
-          persistentVolumeClaim:
-            claimName: pra-data
         - name: backup
           persistentVolumeClaim:
-            claimName: pra-backup
+            claimName: trombi-backup

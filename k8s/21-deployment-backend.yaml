@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: trombi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: trombi/backend:1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: trombi-secrets
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: STORAGE
+              value: local
+            - name: UPLOAD_DIR
+              value: /app/uploads
+          ports:
+            - containerPort: 3000
+          workingDir: /app
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              npx prisma db push --accept-data-loss && node src/server.js
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5

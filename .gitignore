@@ -1,0 +1,21 @@
+backend/node_modules/
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/exports/*
+!backend/exports/.gitkeep
+backend/.env
+
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Packer
+packer_cache/
+.packer.d/
+crash.log
+
+# Ansible
+*.retry
+
+# OS
+.DS_Store
