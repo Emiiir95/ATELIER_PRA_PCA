@@ -275,11 +275,161 @@ Et tout est appliqué dans l'ordre, avec retry, avec attente que chaque service 
 
 ---
 
-## 🎬 Scénarios
+## 🎬 Scénarios PRA/PCA
 
-Voir les fichiers dédiés :
-- **[SCENARIO_1.md](SCENARIO_1.md)** — PCA : crash du pod backend (facile, ~5 min)
-- **SCENARIO_2.md** *(à venir)* — PRA : perte du volume données + restore (intermédiaire, ~15 min)
+Pour les détails commentés étape par étape, voir les fichiers dédiés :
+- **[SCENARIO_1.md](SCENARIO_1.md)** — PCA, crash du pod backend (~5 min)
+- **[SCENARIO_2.md](SCENARIO_2.md)** — PRA, perte du volume + restore (~15 min)
+
+Ci-dessous, **toutes les commandes** à exécuter pour les 2 scénarios.
+
+---
+
+### 🎬 Scénario 1 — PCA : Crash du pod backend
+
+**Objectif** : montrer que Kubernetes recrée automatiquement un pod détruit, sans intervention et sans perte de données.
+
+```bash
+# 1. État initial : note le nom du pod backend
+kubectl -n trombi get pods -l app=backend
+# → backend-XXXXXXXXXX-YYYYY   1/1   Running   0   12m
+
+# 2. Détruis le pod
+kubectl -n trombi delete pod -l app=backend
+
+# 3. Observe Kubernetes recréer un pod automatiquement
+kubectl -n trombi get pods -l app=backend -w
+# (Ctrl+C pour sortir une fois le nouveau pod en Running 1/1)
+
+# 4. Recharge l'app dans ton navigateur : tout est intact
+```
+
+**Résultat attendu** :
+- Nouveau pod avec un nom différent
+- `RESTARTS = 0` (c'est un nouveau pod, pas un restart)
+- App fonctionnelle, données intactes
+
+**Mesures pour le rapport** :
+- **RTO** ≈ 10-30 secondes
+- **RPO** = 0 (aucune perte, la BDD est sur un PVC séparé)
+
+---
+
+### 🎬 Scénario 2 — PRA : Perte du volume + restore
+
+**Objectif** : simuler une perte totale de la base, puis restaurer depuis le dernier backup.
+
+#### Étape A — Préparer : ajouter des données + vérifier les backups
+
+```bash
+# 1. Connecte-toi à l'app et crée 2-3 élèves via l'UI
+# (ou via API si tu préfères)
+
+# 2. Vérifie que le CronJob a déjà tourné au moins une fois
+kubectl -n trombi get cronjob
+# NAME              SCHEDULE      ...   LAST SCHEDULE   AGE
+# postgres-backup   */1 * * * *   ...   30s             5m
+
+kubectl -n trombi get jobs
+# NAME                         STATUS      COMPLETIONS   AGE
+# postgres-backup-XXXXXXXXXX   Complete    1/1           2m
+```
+
+⚠️ Si tu ne vois pas de job `Complete`, **attends 1-2 minutes** que le CronJob fasse son premier passage.
+
+```bash
+# 3. (Optionnel) Visualiser les fichiers de backup dans le PVC
+kubectl -n trombi run debug-backup --rm -it --image=alpine \
+  --overrides='{"spec":{"containers":[{"name":"debug","image":"alpine","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"backup","mountPath":"/backup"}]}],"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":"trombi-backup"}}]}}'
+
+# Dans le pod alpine :
+ls -lh /backup
+# trombi-20260614-130100.dump
+# trombi-20260614-130200.dump
+# ...
+exit
+```
+
+#### Étape B — Détruire la base (catastrophe simulée)
+
+```bash
+# 1. Supprime le Deployment postgres (libère le PVC)
+kubectl -n trombi delete deployment postgres
+
+# 2. Supprime le PVC contenant les données → toute la BDD est PERDUE
+kubectl -n trombi delete pvc trombi-data
+```
+
+À ce stade :
+- Plus de pod postgres
+- Le backend essaie de se reconnecter et échoue (`CrashLoopBackOff`)
+- L'app dans le navigateur renvoie des erreurs 500
+
+#### Étape C — Recréer l'infrastructure vide
+
+```bash
+# 1. Recrée le PVC trombi-data (vide)
+kubectl apply -f k8s/10-pvc-data.yaml
+
+# 2. Redéploie postgres
+kubectl apply -f k8s/20-deployment-postgres.yaml
+
+# 3. Attends qu'il soit Ready
+kubectl -n trombi rollout status deployment/postgres --timeout=180s
+```
+
+À ce stade, la BDD existe mais est **vide** (pas de tables, pas de données).
+
+#### Étape D — Restaurer depuis le dernier backup
+
+```bash
+# Méthode 1 (recommandée) : via Ansible
+ansible-playbook ansible/playbook.yml -e do_restore=true
+
+# Méthode 2 : kubectl direct
+kubectl apply -f pra/50-job-restore.yaml
+kubectl -n trombi wait --for=condition=complete job/postgres-restore --timeout=180s
+kubectl -n trombi logs job/postgres-restore
+```
+
+Le Job `postgres-restore` :
+1. Liste les `.dump` dans `/backup` et prend le plus récent
+2. Lance `pg_restore` pour réimporter le schéma + les données
+
+#### Étape E — Redémarrer le backend (pour qu'il se reconnecte)
+
+```bash
+# Force le pod backend à redémarrer (il avait CrashLoopBackOff)
+kubectl -n trombi delete pod -l app=backend
+
+# Attends qu'il soit Ready
+kubectl -n trombi rollout status deployment/backend
+```
+
+#### Étape F — Vérifier
+
+Recharge l'app dans ton navigateur → les élèves créés à l'étape A sont **revenus** ✅
+
+**Mesures pour le rapport** :
+- **RTO** ≈ 1-2 min (redéploiement postgres + restore)
+- **RPO** ≤ 1 min (intervalle entre 2 backups du CronJob)
+
+---
+
+### 🧹 Nettoyer entre 2 scénarios
+
+Si tu veux **réinitialiser proprement** entre 2 tests :
+
+```bash
+# Re-déploie tout depuis zéro
+ansible-playbook ansible/playbook.yml
+
+# Ou pour TOUT supprimer et repartir vierge :
+kubectl delete namespace trombi
+ansible-playbook ansible/playbook.yml
+# Puis re-seed :
+kubectl -n trombi exec -it deploy/backend -- node prisma/seed.js
+```
 
 ---
 
