@@ -1,252 +1,326 @@
-# ATELIER PRA/PCA — Trombinoscope
+# ATELIER PRA/PCA — Trombinoscope sur Kubernetes
 
-Mini-PRA/PCA appliqué au projet **Trombinoscope** (Node.js + Postgres + React) déployé sur **Kubernetes K3d** dans un **GitHub Codespace**.
+Mini-atelier de **PRA/PCA** (Plan de Reprise / Continuité d'Activité) appliqué au projet **Trombinoscope** (Node.js + Postgres + React).
 
-L'application Trombinoscope (gestion d'élèves, classes, photos, génération PDF) est déployée dans un cluster Kubernetes local. La base PostgreSQL est stockée sur un volume persistant `trombi-data`. Toutes les minutes, un CronJob réalise un `pg_dump` vers un second volume `trombi-backup`. L'**image applicative est construite avec Packer**, le **déploiement orchestré avec Ansible**.
+L'application est déployée dans un cluster **Kubernetes K3d** tournant à l'intérieur d'un **GitHub Codespace**. Les images sont construites avec **Packer**, le déploiement orchestré avec **Ansible**.
 
-Cet atelier illustre la différence entre :
-- **PCA** (continuité) : Kubernetes recrée automatiquement un pod détruit, aucune perte de données
-- **PRA** (reprise) : restauration de la base depuis le dernier backup après perte du volume
+L'objectif est d'expérimenter concrètement la différence entre :
+- **PCA** (continuité) : Kubernetes recrée automatiquement les pods détruits → service jamais interrompu, données préservées (volume persistant)
+- **PRA** (reprise) : restauration manuelle des données depuis un backup après perte totale du volume
 
 ---
 
-## Architecture
+## 📐 Architecture
 
 ```
-                     ┌─────────────────┐
-                     │  Cluster K3d    │
-                     │   namespace:    │
-                     │     trombi      │
-                     └─────────────────┘
-       ┌───────────┐   ┌───────────┐   ┌────────────┐
-       │ frontend  │──▶│  backend  │──▶│ postgres   │
-       │ (nginx)   │   │ (Node.js) │   │  (Pg 16)   │
-       │  :80      │   │  :3000    │   │   :5432    │
-       └───────────┘   └───────────┘   └─────┬──────┘
-                                              │
-                                       ┌──────▼──────┐
-                                       │ trombi-data │  (PVC 1Gi)
-                                       └─────────────┘
+                     ┌────────────────────────┐
+                     │   Cluster K3d          │
+                     │   (1 server + 2 agents)│
+                     │   namespace: trombi    │
+                     └────────────────────────┘
+        ┌────────────┐   ┌────────────┐   ┌─────────────┐
+        │ frontend   │──▶│  backend   │──▶│  postgres   │
+        │  (nginx)   │   │ (Node.js)  │   │   (PG 16)   │
+        │   :80      │   │   :3000    │   │    :5432    │
+        └────────────┘   └────────────┘   └──────┬──────┘
+                                                  │
+                                          ┌───────▼───────┐
+                                          │  trombi-data  │ (PVC 1Gi)
+                                          └───────────────┘
 
-                       ┌────────────────────────┐
-                       │ CronJob (1min)         │
-                       │   pg_dump → /backup    │──▶ trombi-backup (PVC 1Gi)
-                       └────────────────────────┘
+                       ┌─────────────────────────────────┐
+                       │  CronJob postgres-backup        │
+                       │  pg_dump toutes les 1 minute    │──▶ trombi-backup (PVC 1Gi)
+                       └─────────────────────────────────┘
+```
+
+### Composants
+
+| Composant | Rôle | Image Docker | Port |
+|---|---|---|---|
+| **frontend** | UI React (Vite build servi par Nginx). Proxifie `/api/*` vers le backend. | `trombi/frontend:1.0` | 80 |
+| **backend** | API Node.js (Express + Prisma). Exécute `prisma db push` au démarrage pour synchroniser le schéma BDD. | `trombi/backend:1.0` | 3000 |
+| **postgres** | Base de données PostgreSQL 16. Données stockées sur le PVC `trombi-data`. | `postgres:16` | 5432 |
+| **postgres-backup** | CronJob qui lance `pg_dump` toutes les minutes vers le PVC `trombi-backup`. | `postgres:16` | — |
+| **postgres-restore** | Job manuel qui restaure depuis le dernier dump (`pg_restore`). | `postgres:16` | — |
+
+### Volumes persistants
+
+| PVC | Taille | Contenu |
+|---|---|---|
+| `trombi-data` | 1Gi | Fichiers de la base PostgreSQL (`/var/lib/postgresql/data/pgdata`) |
+| `trombi-backup` | 1Gi | Fichiers de backup `trombi-YYYYMMDD-HHMMSS.dump` |
+
+---
+
+## 🗂️ Structure du repo
+
+```
+.
+├── .devcontainer/
+│   ├── devcontainer.json         # Config Codespace (Docker-in-Docker + kubectl)
+│   └── post-create.sh            # Installe k3d, Packer, Ansible automatiquement
+│
+├── backend/                      # Code source du backend Trombinoscope
+│   ├── src/                      # Routes, controllers, services, middlewares
+│   ├── prisma/                   # Schéma Prisma + seed + migrations
+│   ├── tests/                    # Tests Jest
+│   ├── Dockerfile                # Build manuel (non utilisé — Packer s'en charge)
+│   └── package.json
+│
+├── frontend/                     # Code source du frontend Trombinoscope
+│   ├── src/                      # Pages React, composants, context
+│   ├── nginx.conf                # Reverse-proxy /api → backend:3000
+│   ├── Dockerfile                # Build manuel (non utilisé — Packer s'en charge)
+│   └── package.json
+│
+├── packer.pkr.hcl                # Définit le build des 2 images Docker
+│
+├── k8s/                          # Manifestes Kubernetes (appliqués dans l'ordre alphabétique)
+│   ├── 00-namespace.yaml         # Crée le namespace "trombi"
+│   ├── 05-secret.yaml            # Secret avec DATABASE_URL, JWT_SECRET, POSTGRES_*
+│   ├── 10-pvc-data.yaml          # PVC pour les données PostgreSQL
+│   ├── 11-pvc-backup.yaml        # PVC pour les backups
+│   ├── 20-deployment-postgres.yaml  # Deployment PostgreSQL + probes
+│   ├── 21-deployment-backend.yaml   # Deployment backend Node.js
+│   ├── 22-deployment-frontend.yaml  # Deployment frontend Nginx
+│   ├── 30-services.yaml          # 3 Services ClusterIP (postgres, backend, frontend)
+│   └── 40-cronjob-backup.yaml    # CronJob pg_dump chaque minute
+│
+├── pra/
+│   └── 50-job-restore.yaml       # Job manuel de restore (utilisé dans le scénario PRA)
+│
+├── ansible/
+│   └── playbook.yml              # Orchestration : cluster + import images + apply manifests
+│
+├── SCENARIO_1.md                 # Walkthrough détaillé du scénario PCA
+└── README.md                     # Ce fichier
 ```
 
 ---
 
-## Séquence 1 — Codespace
+## 🚀 Comment ça marche : le déroulé complet
 
-1. **Fork** ce repo
-2. Sur ton fork : **Code → Codespaces → Create codespace on main**
-3. Attends que le `postCreateCommand` finisse (~3 min : k3d, packer, ansible sont installés automatiquement)
+### Étape 1 — Ouvrir un Codespace
 
----
+Sur le repo GitHub, clique sur **Code → Codespaces → Create codespace on main**.
 
-## Séquence 2 — Créer le cluster
+Un environnement Linux Ubuntu démarre dans VS Code (dans ton navigateur). Le script `.devcontainer/post-create.sh` installe automatiquement :
+- **k3d** (lance Kubernetes dans Docker)
+- **Packer** v1.11.2 (build des images Docker)
+- **Ansible** + collection `kubernetes.core`
+
+⏱️ Durée : ~3 min après création du Codespace.
+
+### Étape 2 — Créer le cluster Kubernetes
 
 ```bash
-# Crée le cluster K3d (1 master + 2 workers)
 k3d cluster create trombi --servers 1 --agents 2
-
-# Vérifie
-kubectl get nodes
 ```
 
----
+Ça lance 4 conteneurs Docker :
+- `k3d-trombi-server-0` : nœud master Kubernetes (le "control plane")
+- `k3d-trombi-agent-0` et `k3d-trombi-agent-1` : 2 nœuds workers
+- `k3d-trombi-serverlb` : load balancer interne
 
-## Séquence 3 — Builder les images avec Packer
+Vérification :
+```bash
+kubectl get nodes
+```
+→ 3 nœuds en statut `Ready`.
+
+### Étape 3 — Construire les images avec Packer
 
 ```bash
 packer init .
 packer build -var "image_tag=1.0" .
-
-# Vérifie
-docker images | grep trombi
-# trombi/backend   1.0   ...
-# trombi/frontend  1.0   ...
 ```
 
-Packer construit **2 images** :
-- `trombi/backend:1.0` — Node 20 + Prisma + dépendances backend
-- `trombi/frontend:1.0` — Vite build → Nginx alpine servant les statics
+Packer lit le fichier `packer.pkr.hcl` qui définit **2 builds en parallèle** :
 
----
+**Build #1 (backend)** :
+1. Pull `node:20-slim`
+2. Copie `backend/` dans `/app`
+3. Installe `openssl`, `libvips` (pour la lib `sharp` de manipulation d'images)
+4. `npm ci` + `npx prisma generate`
+5. Tag final : `trombi/backend:1.0`
 
-## Séquence 4 — Déployer avec Ansible
+**Build #2 (frontend)** :
+1. Pull `nginx:alpine`
+2. Installe temporairement Node + pnpm
+3. Copie `frontend/` dans `/build`
+4. Copie `nginx.conf` dans `/etc/nginx/conf.d/default.conf`
+5. `pnpm install` + `pnpm build`
+6. Copie le résultat dans `/usr/share/nginx/html`
+7. Désinstalle Node + pnpm (image plus légère)
+8. Tag final : `trombi/frontend:1.0`
+
+⏱️ Durée : ~2 min pour les 2 images en parallèle.
 
 ```bash
-# Import les images dans le cluster k3d
+docker images | grep trombi
+# trombi/backend    1.0   ~1 GB
+# trombi/frontend   1.0   ~417 MB
+```
+
+### Étape 4 — Importer les images dans K3d
+
+K3d a son propre registre interne (séparé de Docker). Il faut copier les images dedans :
+
+```bash
 k3d image import trombi/backend:1.0 -c trombi
 k3d image import trombi/frontend:1.0 -c trombi
+```
 
-# Déploie tout (postgres + backend + frontend + CronJob backup)
+Ces commandes packagent l'image en tarball et la chargent dans chaque nœud du cluster.
+
+### Étape 5 — Déployer avec Ansible
+
+```bash
 ansible-playbook ansible/playbook.yml
 ```
 
-Le playbook :
-1. Vérifie que le cluster K3d existe (le crée sinon)
-2. Importe les images Docker
-3. Applique tous les manifestes `k8s/`
-4. Attend que chaque déploiement soit `Ready`
-5. Affiche les services
+Ce playbook fait, dans l'ordre :
+1. Vérifie que k3d et le cluster existent
+2. Importe les 2 images dans le cluster (redondant mais idempotent)
+3. `kubectl apply -f k8s/` → applique tous les manifestes :
+   - Crée le namespace `trombi`
+   - Crée le Secret (mots de passe, JWT_SECRET, DATABASE_URL)
+   - Crée les 2 PVC
+   - Lance les 3 Deployments (postgres, backend, frontend)
+   - Crée les 3 Services (ClusterIP interne)
+   - Active le CronJob de backup
+4. Attend que chaque Deployment soit `Ready` (status check toutes les 5s)
+5. Affiche la liste finale des services
 
----
-
-## Séquence 5 — Accéder à l'application
-
-```bash
-# Forward le port 80 du frontend vers ton Codespace
-kubectl -n trombi port-forward svc/frontend 8080:80 >/tmp/web.log 2>&1 &
-```
-
-Dans Codespace, onglet **PORTS** → rends **public** le port 8080. Ouvre l'URL.
-
-**Connexion** :
-- Email : `admin@trombi.fr`
-- Mot de passe : `Admin123!`
-
-(Le seed se fait au premier démarrage backend, voir notes ci-dessous)
-
-### Seed initial de la base
-
-Une fois le backend Ready, exécute le seed pour créer les comptes admin/teacher et les classes/élèves :
+### Étape 6 — Seeder la base
 
 ```bash
 kubectl -n trombi exec -it deploy/backend -- node prisma/seed.js
 ```
 
----
+Crée :
+- 3 utilisateurs : `admin@trombi.fr / Admin123!` (admin) + 2 teachers
+- 3 classes : BTS SIO SLAM, BTS SIO SISR, Bachelor DevOps
+- 15 élèves dont 12 avec photos seed
 
-## Séquence 6 — Visualiser les backups
-
-Le CronJob `postgres-backup` tourne **toutes les minutes** :
-
-```bash
-# Liste les backups dans le PVC trombi-backup
-kubectl -n trombi run debug-backup \
-  --rm -it --image=alpine \
-  --overrides='{"spec":{"containers":[{"name":"debug","image":"alpine","command":["sh"],"stdin":true,"tty":true,"volumeMounts":[{"name":"backup","mountPath":"/backup"}]}],"volumes":[{"name":"backup","persistentVolumeClaim":{"claimName":"trombi-backup"}}]}}'
-
-# Une fois dans le pod :
-ls -lh /backup
-exit
-```
-
-Tu verras les fichiers `trombi-YYYYMMDD-HHMMSS.dump`.
-
----
-
-## 💥 Scénario 1 : PCA — Crash du pod backend
-
-Objectif : démontrer que **Kubernetes recrée automatiquement** un pod détruit, **sans perte de données**.
+### Étape 7 — Accéder à l'app
 
 ```bash
-# Avant : on note l'ID du pod
-kubectl -n trombi get pods -l app=backend
-
-# On supprime le pod
-kubectl -n trombi delete pod -l app=backend
-
-# Kubernetes en recrée un automatiquement
-kubectl -n trombi get pods -l app=backend -w
-# (Ctrl+C pour sortir)
+kubectl -n trombi port-forward svc/frontend 8080:80 > /tmp/web.log 2>&1 &
 ```
 
-**Observation** : un nouveau pod apparaît en quelques secondes. Connecte-toi à l'app → toutes les données sont là (la BDD est dans le PVC, hors du pod).
+Dans Codespace, onglet **PORTS** (en bas, à côté de Terminal) :
+1. Port 8080 apparaît automatiquement
+2. Clic droit → **Port Visibility → Public**
+3. Clic sur 🌐 → ouvre l'URL `https://<id>-8080.app.github.dev/`
 
-**Mesure** :
-- **RTO** (Recovery Time Objective) : ~10-30 s (temps de redémarrage du pod)
-- **RPO** (Recovery Point Objective) : 0 (aucune perte de données)
+Connecte-toi : `admin@trombi.fr` / `Admin123!`
 
 ---
 
-## 💥 Scénario 2 : PRA — Perte du volume de données
+## 💡 Comprendre les concepts clés
 
-Objectif : simuler une perte de la base (suppression du PVC), puis **restaurer depuis le dernier backup**.
+### Pourquoi Kubernetes ?
 
-### Étape A : ajouter de la donnée
+Imagine que ton backend crash en pleine nuit. Avec Docker simple :
+- Le conteneur est mort
+- Tu dois te lever et faire `docker restart`
 
-Crée quelques élèves via l'UI (ou un appel API). Vérifie qu'au moins 1 minute s'est écoulée depuis ton dernier ajout pour avoir un backup à jour.
+Avec Kubernetes :
+- Le pod est détruit
+- Le **Deployment** veille → il en relance un automatiquement
+- Le service continue à fonctionner pour les utilisateurs
 
-### Étape B : détruire le volume de données
+C'est le principe du **PCA** : continuité automatique.
 
+### Pourquoi des PVC (PersistentVolumeClaim) ?
+
+Si Postgres stockait ses données **dans le conteneur**, à chaque redémarrage tout serait perdu. Le PVC est un volume **externe** au pod : le pod meurt, mais les données restent.
+
+C'est ce qui permet au scénario PCA de fonctionner : on tue le pod backend → la BDD survit.
+
+### Pourquoi des backups (CronJob) ?
+
+Le PVC peut quand même être perdu (corruption disque, suppression accidentelle, attaque ransomware…). Sans backup → données perdues définitivement.
+
+Le **CronJob** `postgres-backup` exécute `pg_dump` toutes les minutes vers un **second PVC** (`trombi-backup`). C'est le principe du **PRA** : si la base est perdue, on restaure depuis le dernier dump.
+
+### Pourquoi Packer ?
+
+Au lieu de `docker build` à la main, Packer permet de :
+- Versionner la construction (image_tag=1.0)
+- Builder en parallèle plusieurs images
+- Définir le build dans un fichier HCL versionnable
+- Faire la même chose pour AWS AMI, GCP, etc. (multi-cloud)
+
+### Pourquoi Ansible ?
+
+Pour déployer **sans erreurs humaines**. Au lieu de :
 ```bash
-# Supprime le déploiement postgres (libère le PVC)
-kubectl -n trombi delete deployment postgres
-
-# Supprime le PVC contenant les données
-kubectl -n trombi delete pvc trombi-data
-```
-
-⚠️ À ce stade, la BDD est **vide**.
-
-### Étape C : recréer le PVC + redéployer
-
-```bash
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/05-secret.yaml
 kubectl apply -f k8s/10-pvc-data.yaml
-kubectl apply -f k8s/20-deployment-postgres.yaml
-
-# Attends que Postgres soit prêt
-kubectl -n trombi rollout status deployment/postgres
+# ...etc
+kubectl rollout status deployment/postgres
+# ...etc
 ```
 
-### Étape D : restaurer depuis le backup
-
+Tu fais juste :
 ```bash
-# Joue le Job de restauration (pg_restore depuis le dernier .dump)
-ansible-playbook ansible/playbook.yml -e do_restore=true
+ansible-playbook ansible/playbook.yml
 ```
 
-Ou manuellement :
-
-```bash
-kubectl apply -f pra/50-job-restore.yaml
-kubectl -n trombi wait --for=condition=complete job/postgres-restore --timeout=180s
-kubectl -n trombi logs job/postgres-restore
-```
-
-### Étape E : vérifier
-
-Reconnecte-toi à l'application → toutes les données du dernier backup sont restaurées.
-
-**Mesure** :
-- **RTO** : ~1-2 min (redéploiement + restore)
-- **RPO** : ≤ 1 min (intervalle entre 2 backups CronJob)
+Et tout est appliqué dans l'ordre, avec retry, avec attente que chaque service soit prêt.
 
 ---
 
-## Structure du repo
+## 🎬 Scénarios
 
+Voir les fichiers dédiés :
+- **[SCENARIO_1.md](SCENARIO_1.md)** — PCA : crash du pod backend (facile, ~5 min)
+- **SCENARIO_2.md** *(à venir)* — PRA : perte du volume données + restore (intermédiaire, ~15 min)
+
+---
+
+## 🆘 Troubleshooting
+
+### `kubectl get nodes` → connection refused
+Le cluster K3d n'est pas démarré. Lance `k3d cluster create trombi --servers 1 --agents 2`.
+
+### Port 8080 already in use
+Un précédent port-forward tourne encore :
+```bash
+pkill -f "port-forward"
+kubectl -n trombi port-forward svc/frontend 8080:80 > /tmp/web.log 2>&1 &
 ```
-.
-├── .devcontainer/        # Configuration Codespace (devcontainer.json + post-create.sh)
-├── ansible/
-│   └── playbook.yml      # Orchestration du déploiement K8s
-├── backend/              # Code source Trombinoscope backend (Node.js + Prisma)
-├── frontend/             # Code source Trombinoscope frontend (React + Vite)
-├── k8s/                  # Manifestes Kubernetes
-│   ├── 00-namespace.yaml
-│   ├── 05-secret.yaml
-│   ├── 10-pvc-data.yaml
-│   ├── 11-pvc-backup.yaml
-│   ├── 20-deployment-postgres.yaml
-│   ├── 21-deployment-backend.yaml
-│   ├── 22-deployment-frontend.yaml
-│   ├── 30-services.yaml
-│   └── 40-cronjob-backup.yaml
-├── pra/
-│   └── 50-job-restore.yaml   # Job de restore postgres
-├── packer.pkr.hcl        # Build des 2 images Docker (backend + frontend)
-└── README.md
+
+### Build Packer échoue
+Vérifie que Docker tourne dans le Codespace :
+```bash
+docker ps
+```
+
+### Pod backend en `CrashLoopBackOff`
+Probablement Postgres pas encore prêt. Vérifie :
+```bash
+kubectl -n trombi get pods
+kubectl -n trombi logs deploy/backend
 ```
 
 ---
 
-## Notes & limites
+## 📚 Concepts à connaître pour la soutenance
 
-- Le cluster K3d tourne dans le Codespace : **éphémère**, tout disparaît quand le Codespace s'éteint.
-- Pour un vrai PRA prod, il faudrait **réplication géographique** (backup vers un stockage hors-cluster, type S3).
-- Le `JWT_SECRET` dans `k8s/05-secret.yaml` est dev — à changer en prod.
-- L'option `STORAGE=local` du backend stocke les photos dans `/app/uploads` (éphémère). Pour persister, brancher MinIO ou S3.
+| Terme | Définition |
+|---|---|
+| **PCA** | Plan de Continuité d'Activité — le service reste disponible malgré une panne |
+| **PRA** | Plan de Reprise d'Activité — comment retrouver l'état avant catastrophe |
+| **RTO** | Recovery Time Objective — temps maximum pour redevenir opérationnel |
+| **RPO** | Recovery Point Objective — perte de données maximale acceptable (en temps) |
+| **Pod** | Plus petite unité Kubernetes — contient 1 ou plusieurs conteneurs |
+| **Deployment** | Décrit l'état souhaité d'un ensemble de pods (replicas, image, etc.) |
+| **Service** | Point d'entrée stable pour accéder aux pods (load balancing interne) |
+| **PVC** | PersistentVolumeClaim — volume de stockage persistant, externe aux pods |
+| **CronJob** | Job exécuté périodiquement selon un planning cron |
+| **Namespace** | Isolation logique d'un groupe de ressources dans le cluster |
