@@ -265,3 +265,72 @@ Tu peux considérer ce scénario validé si :
 🎉 **Bravo, tu as validé le scénario PCA !**
 
 ➡️ **Prochaine étape** : le scénario 2 (PRA) — beaucoup plus impressionnant car on simule une vraie catastrophe (perte de la base) et on restaure depuis backup.
+
+---
+
+## 📒 Mon vécu — Manipulation réalisée
+
+Voici les commandes que **j'ai personnellement exécutées** dans mon Codespace et les sorties obtenues. Cette section sert de **trace pour le compte rendu**.
+
+### 1. Observation du pod backend initial
+
+```bash
+$ kubectl -n trombi get pods -l app=backend
+NAME                       READY   STATUS    RESTARTS      AGE
+backend-647b97b5b6-rvxgt   1/1     Running   3 (11m ago)   12m
+```
+
+**Analyse** :
+- Nom du pod : `backend-647b97b5b6-rvxgt`
+- `1/1 Ready` : le seul conteneur du pod est prêt
+- `3 RESTARTS` : 3 redémarrages dans le passé (probablement à l'init quand postgres n'était pas encore prêt)
+- `AGE: 12m` : tourne depuis 12 minutes
+
+### 2. Destruction du pod (la "panne" simulée)
+
+```bash
+$ kubectl -n trombi delete pod -l app=backend
+pod "backend-647b97b5b6-rvxgt" deleted from trombi namespace
+```
+
+À ce moment précis, le pod backend est **détruit**. Le service `backend` n'a plus aucun endpoint disponible.
+
+### 3. Observation de la recréation automatique
+
+```bash
+$ kubectl -n trombi get pods -l app=backend -w
+NAME                       READY   STATUS    RESTARTS   AGE
+backend-647b97b5b6-gm2sl   1/1     Running   0          111s
+```
+
+**Analyse** :
+- Nouveau pod : `backend-647b97b5b6-gm2sl` (hash ReplicaSet identique, suffixe différent → c'est bien un **nouveau pod**)
+- `RESTARTS: 0` → c'est une création fraîche, pas un restart du précédent
+- En **moins de 2 minutes**, Kubernetes a détecté la perte du pod, en a recréé un nouveau, et il est `Ready` (`1/1`)
+- **Aucune intervention humaine** n'a été nécessaire — le Deployment a tout géré
+
+### 4. Vérification dans l'app
+
+J'ai rafraîchi l'app dans mon navigateur (port-forward sur 8080) :
+- ✅ Connexion toujours active (le JWT côté navigateur est resté valide)
+- ✅ Les données seedées (3 classes, 15 élèves) étaient toujours là
+- ✅ Aucune perte de données — la BDD est dans le PVC `trombi-data`, **non touché** par la suppression du pod backend
+
+### 📊 Mes mesures
+
+| Métrique | Valeur observée |
+|---|---|
+| RTO mesuré (création nouveau pod + Ready) | **≤ 2 min** (probablement plus proche de 15-30 s, le `-w` n'a pas affiché les états intermédiaires car j'ai laissé tourner) |
+| RPO mesuré | **0 seconde** (toutes les données restent intactes) |
+| Action humaine requise | **Aucune** ✅ |
+
+### 🎯 Conclusion de ma manipulation
+
+Le scénario **PCA est validé** :
+- Kubernetes a bien fait son travail d'orchestrateur (auto-healing)
+- Le pattern "compute stateless + storage stateful" prouve son efficacité
+- Le service applicatif a été indisponible quelques secondes (le temps que le nouveau pod boot), mais les utilisateurs n'ont rien vu sauf un éventuel "Réessayer" sur leur clic au mauvais moment
+
+Pour rendre l'app **100 % disponible** sans aucune interruption même à la milliseconde, il aurait fallu :
+- `replicas: 2` ou plus dans le Deployment
+- Un `PodDisruptionBudget` pour garantir qu'au moins 1 reste toujours actif
